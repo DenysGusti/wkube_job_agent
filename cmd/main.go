@@ -150,6 +150,7 @@ func cmdRun(command string) {
 			fmt.Fprintf(services.MultiLogWriter, "warning: could not touch main_done file: %v\n", err)
 		}
 
+		services.FlushLogMasker()
 		cancel()
 		services.RemoteLogSink.Wait()
 		services.RemoteLogSink.FinalFlush()
@@ -175,6 +176,15 @@ func cmdRun(command string) {
 		exitCode = 1
 		return
 	}
+
+	// Mark this job alive in the shared overlay before sweeping, so concurrent
+	// sweeps on the same node never treat its files as abandoned.
+	if err := services.StartOverlayHeartbeat(); err != nil {
+		fmt.Fprintf(services.MultiLogWriter, "error: %v\n", err)
+		exitCode = 1
+		return
+	}
+	services.SweepStaleOverlayFiles()
 
 	if err := services.PreProcessMappings(); err != nil {
 		fmt.Fprintf(services.MultiLogWriter, "error in pre-process-mappings: %v\n", err)
@@ -262,9 +272,9 @@ func cmdRun(command string) {
 		if time.Since(globalStartTime) < 2*time.Minute && ctx.Err() == nil {
 			stderrStr := stderrBuf.String()
 			if strings.Contains(stderrStr, "No such file or directory") && strings.Contains(stderrStr, "/mnt/wdrv") {
-				fmt.Fprintf(services.MultiLogWriter, "\n[Agent] Detected missing /mnt/wdrv file. Forcing cache invalidate and retrying script in 10s (attempt %d/12)...\n\n", attempt)
-				services.InvalidateFUSECacheForPath("/mnt/wdrv")
+				fmt.Fprintf(services.MultiLogWriter, "\n[Agent] Detected missing /mnt/wdrv file. Refreshing the mount and retrying script in 10s (attempt %d/12)...\n\n", attempt)
 				time.Sleep(10 * time.Second)
+				services.RefreshWdrv()
 				continue
 			}
 		}
@@ -321,6 +331,7 @@ func cmdFinalize() {
 
 	if err := waitForMount(ctx); err != nil {
 		fmt.Fprintf(services.MultiLogWriter, "%v\n", err)
+		services.FlushLogMasker()
 		services.RemoteLogSink.FinalFlush()
 		os.Exit(1)
 	}
@@ -332,10 +343,6 @@ func cmdFinalize() {
 		}
 	}()
 
-	// Invalidate the FUSE cache for /mnt/wdrv upfront to ensure all subsequent
-	// finalize steps (like UploadWdrvFilesCreatedByJobGid) see the latest files.
-	services.InvalidateFUSECacheForPath("/mnt/wdrv")
-
 	postProcessErr := services.PostProcessMappings()
 	if postProcessErr != nil {
 		fmt.Fprintf(services.MultiLogWriter, "error in post-process-mappings: %v\n", postProcessErr)
@@ -345,6 +352,7 @@ func cmdFinalize() {
 	if wdrvUploadErr != nil {
 		fmt.Fprintf(services.MultiLogWriter, "error in wdrv-gid-upload: %v\n", wdrvUploadErr)
 	}
+	services.StopOverlayHeartbeat()
 
 
 	if err := services.UpdateJobStatus("MAPPING_OUTPUTS"); err != nil {
@@ -355,18 +363,17 @@ func cmdFinalize() {
 		fmt.Fprintf(services.MultiLogWriter, "error executing post task registry: %v\n", err)
 	}
 
+	services.FlushLogMasker()
 	projectSlug := services.GetProjectSlug()
 	if projectSlug != "" {
 		if err := services.RemotePushLog(services.JobLogPath, services.LogFileName, projectSlug); err != nil {
 			fmt.Fprintf(services.MultiLogWriter, "error uploading job log via xet: %v\n", err)
 		}
 	} else {
-		fmt.Fprintln(services.MultiLogWriter, "warning: project slug not found, attempting standard upload")
-		if err := services.UploadFile(services.JobLogPath, services.LogFileName); err != nil {
-			fmt.Fprintf(services.MultiLogWriter, "error uploading job log: %v\n", err)
-		}
+		fmt.Fprintln(services.MultiLogWriter, "error uploading job log: project slug not found")
 	}
 
+	services.FlushLogMasker()
 	services.RemoteLogSink.FinalFlush()
 
 	if exitCode == 0 && postProcessErr == nil && wdrvUploadErr == nil {
